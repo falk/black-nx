@@ -12,8 +12,8 @@ labels: ["recomp bug"]
 
 ## Log Files:
 
-<!-- Please include your log file, black.log, located in the logs folder next to BLACK.exe. It is replaced each time the game is started, so attach it before launching again.-->
-<!-- If the game crashed, also include the newest .dmp file from the CrashDumps folder next to BLACK.exe.-->
+<!-- Attach the relevant files from sdmc:/switch/black/logs/ or your captured nxlink output. Save the log before launching again. -->
+<!-- Include the NRO revision, Horizon version, handheld/docked mode, launcher and any clock overrides. For crashes, include the register/backtrace output if available. -->
 <!-- Just drag the files themselves directly onto this box to upload them, no need to copy/paste the contents manually.-->
 <!-- Your issue report may be closed if you do not include your log files.-->
 

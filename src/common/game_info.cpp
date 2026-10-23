@@ -9,6 +9,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#ifdef __SWITCH__
+#include <switch.h>
+#endif
 
 #include <toml++/toml.hpp>
 
@@ -127,6 +130,21 @@ void Rumble(int port, uint16_t& left, uint16_t& right) {
 
 // the Windows display language when the game has it, else English
 std::string SystemLanguage() {
+#ifdef __SWITCH__
+    u64 code = 0;
+    SetLanguage language = SetLanguage_ENUS;
+    if (R_SUCCEEDED(setInitialize())) {
+        if (R_SUCCEEDED(setGetSystemLanguage(&code))) setMakeLanguage(code, &language);
+        setExit();
+    }
+    switch (language) {
+        case SetLanguage_FR: case SetLanguage_FRCA: return "fra";
+        case SetLanguage_DE: return "deu";
+        case SetLanguage_IT: return "ita";
+        case SetLanguage_ES: case SetLanguage_ES419: return "esp";
+        default: return "int";
+    }
+#else
     switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
         case LANG_FRENCH: return "fra";
         case LANG_GERMAN: return "deu";
@@ -134,6 +152,7 @@ std::string SystemLanguage() {
         case LANG_SPANISH: return "esp";
         default: return "int";
     }
+#endif
 }
 
 // what the options list cannot hold

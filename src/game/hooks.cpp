@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <thread>
 
 #include "app/app.h"
@@ -50,9 +51,7 @@ void VerticalBlank(X86Context& ctx) {
             W32(info + 8, 0);
             CallGuest(ctx, callback, {info});
         }
-        // the game clears the event itself before each wait, which the host object does not see
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        ResetEvent(*event);
+        // the event stays signalled: the game clears it itself (SignalState = 0) before each wait
     }
 }
 
@@ -69,6 +68,9 @@ void StoreViewport(X86Context&, uint8_t*) {
     W32(p + 12, v.h);
     WriteFloat(p + 16, v.min_z);
     WriteFloat(p + 20, v.max_z);
+    // Keep the recompiled viewport getter consistent with the renderer.
+    WriteFloat(kDevice + XDK_CDevice_ScreenSpaceOffset, d3d::State().ss_offset_x);
+    WriteFloat(kDevice + XDK_CDevice_ScreenSpaceOffset + 4, d3d::State().ss_offset_y);
 }
 
 // D3DDevice_GetViewportOffsetAndScale
@@ -631,5 +633,10 @@ void SkipVideo(X86Context&, uint8_t*) {
     if (background || state < 2 || state > kFilmPlaying) return;
     std::string name = ReadCString(player + kFilmName, 8);
     bool intro = name.rfind("LO_", 0) == 0 || name.rfind("02_", 0) == 0;
-    if (pressed || (game::Opt().skip_intros && intro)) G<uint8_t>(player + kFilmStop) = 1;
+    // BLACK_SKIP_FILMS=1 (test runs): every film but the menus' backgrounds stops as it starts
+    static const bool skip_all = [] {
+        const char* v = std::getenv("BLACK_SKIP_FILMS");
+        return v && *v == '1';
+    }();
+    if (pressed || skip_all || (game::Opt().skip_intros && intro)) G<uint8_t>(player + kFilmStop) = 1;
 }

@@ -1,3 +1,18 @@
+#ifdef __SWITCH__
+// The injected pages expose the Windows panel and keyboard bindings. Switch has
+// neither: its app::rows::Page returns no rows. Building that empty Flash page
+// installs a null focus button, which the guest script subsequently dereferences.
+// Keep the original controller, sound, picture and profile menus unchanged.
+#include "xdk/hle.h"
+
+void OptionsMenu(X86Context&, uint8_t*) {}
+
+namespace game {
+bool OptionsCapturing() { return false; }
+uint32_t OptionsText(uint32_t) { return 0; }
+}  // namespace game
+
+#else
 // Recomp settings in the game's own options menus: RECOMP SETTINGS, MOUSE AND KEYBOARD and CONTROLLER buttons under
 // the stock ones load the page again with the F10 panel's rows in their place. A row is two copies of a stock button
 // clip, its name and its value; the name's copy stands in for the script's button object, so the script moves the
@@ -607,3 +622,4 @@ uint32_t OptionsText(uint32_t id) {
 }
 
 }  // namespace game
+#endif

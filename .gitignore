@@ -6,9 +6,14 @@
 *.exe
 *.obj
 *.o
+*.nro
+*.nso
+*.nacp
+*.elf
+*.map
 
-# recompiled code, derived from the game
-/generated/
+# recompiled code, derived from the game (a folder or a link)
+/generated
 
 # user's own game files
 /assets/
@@ -26,3 +31,9 @@ black.toml
 
 # Local temporary folder
 .local
+
+# Python tool caches
+__pycache__/
+
+# game code translated at build time (switch/recomp.sh), never committed
+src/game/hot_xmv_idct*.inc

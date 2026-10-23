@@ -8,12 +8,18 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef __SWITCH__
+#include <arm_neon.h>
+#include <switch.h>
+#else
 #include <windows.h>
 #include <smmintrin.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -24,6 +30,8 @@
 
 #include "core/diag.h"
 #include "core/log.h"
+#include "d3d/gpu_frame.h"
+#include "d3d/vsc_dirty.h"
 #include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -79,6 +87,20 @@ struct Range {
 size_t At(const State& s, const void* p) {
     return size_t(static_cast<const uint8_t*>(p) - reinterpret_cast<const uint8_t*>(&s));
 }
+// Resource headers are aligned; mixing higher address bits avoids mapping
+// whole groups of neighbouring allocations onto the same recent-cache slots.
+size_t ResourceSlot(uint32_t header) { return ((header >> 4) ^ (header >> 10)) & 63; }
+
+// These snapshots are exactly 20 bytes. Compare them without an out-of-line
+// memcmp call or reading beyond a short resource's padded snapshot.
+bool SameHeader(const uint8_t* a, const uint8_t* b) {
+    uint64_t ax[2], bx[2];
+    uint32_t at, bt;
+    std::memcpy(ax, a, 16); std::memcpy(bx, b, 16);
+    std::memcpy(&at, a + 16, 4); std::memcpy(&bt, b + 16, 4);
+    return ((ax[0] ^ bx[0]) | (ax[1] ^ bx[1]) | uint64_t(at ^ bt)) == 0;
+}
+
 // bytes of the simple render states from method first to method last
 size_t SimpleBytes(uint32_t first, uint32_t last) { return size_t(last - first) + sizeof(uint32_t); }
 std::vector<Range> StateRanges() {
@@ -91,13 +113,44 @@ std::vector<Range> StateRanges() {
         {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
         {At(s, &s.vsc), At(s, &s.rt) - At(s, &s.vsc)},
         {At(s, &s.scissor_count), At(s, &s.transforms) - At(s, &s.scissor_count)},
-        {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
-        {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
-        {At(s, &s.transforms[256]), sizeof(s.transforms[0])},
-        {At(s, &s.material), sizeof(State) - At(s, &s.material)},
+        {At(s, &s.light_enable), sizeof(State) - At(s, &s.light_enable)},
     };
 }
 
+// the fixed function vertex state: transforms, material and lights, read by draws without a vertex program only, so
+// sent with those (a vertex program draw leaves them as last sent; the next fixed function draw sends what changed)
+std::vector<Range> FixedRanges() {
+    static const State s;
+    return {
+        {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
+        {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
+        {At(s, &s.transforms[256]), sizeof(s.transforms[0])},
+        {At(s, &s.material), At(s, &s.light_enable) - At(s, &s.material)},
+    };
+}
+
+#ifdef __SWITCH__
+// the bits where 16 bytes of a and b differ; none set: equal
+inline uint8x16_t Diff16(const uint8_t* a, const uint8_t* b) { return veorq_u8(vld1q_u8(a), vld1q_u8(b)); }
+inline bool Zero(uint8x16_t d) { return vmaxvq_u32(vreinterpretq_u32_u8(d)) == 0; }
+
+// equal bytes, 16 at a time: most of the state is compared on every draw
+bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
+    size_t i = 0;
+    uint8x16_t diff = vdupq_n_u8(0);
+    for (; i + 16 <= n; i += 16) diff = vorrq_u8(diff, Diff16(a + i, b + i));
+    if (!Zero(diff)) return false;
+    return i == n || !std::memcmp(a + i, b + i, n - i);
+}
+
+constexpr size_t kPiece = 64;  // bytes compared and sent at once
+
+// equal 64 byte pieces, the scan over the state on every draw
+bool SamePiece(const uint8_t* a, const uint8_t* b) {
+    uint8x16_t diff = vorrq_u8(vorrq_u8(Diff16(a, b), Diff16(a + 16, b + 16)), vorrq_u8(Diff16(a + 32, b + 32), Diff16(a + 48, b + 48)));
+    return Zero(diff);
+}
+#else
 // equal bytes, 16 at a time: most of the state is compared on every draw
 bool Same(const uint8_t* a, const uint8_t* b, size_t n) {
     size_t i = 0;
@@ -121,6 +174,7 @@ bool SamePiece(const uint8_t* a, const uint8_t* b) {
     }
     return _mm_testz_si128(diff, diff);
 }
+#endif
 
 using Clock = std::chrono::steady_clock;
 uint64_t Ns(Clock::time_point t) {
@@ -129,7 +183,7 @@ uint64_t Ns(Clock::time_point t) {
 
 class Threaded final : public Backend {
 public:
-    explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)), ranges_(StateRanges()) {
+    explicit Threaded(std::unique_ptr<Backend> inner) : inner_(std::move(inner)), ranges_(StateRanges()), fixed_(FixedRanges()) {
         ring_ = mem::AllocSystem(kHeaderRing, 64);
         cur_ = NewBatch();
         std::thread([this] { Run(); }).detach();
@@ -149,7 +203,9 @@ public:
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         auto t = Clock::now();
-        SendState(s);
+        SendState(s, true);
+        state_ns_ += Ns(t);
+        draws_++;
         Cmd c{Op::Draw};
         c.a = prim;
         c.b = start;
@@ -157,6 +213,7 @@ public:
         if (indices) {
             c.d = 1;
             c.data = Put(indices, size_t(count) * 2);
+            index_bytes_ += size_t(count) * 2;
         }
         cur_->cmds.push_back(c);
         for (uint32_t tex : s.textures) Use(tex);
@@ -166,7 +223,9 @@ public:
         Use(s.zs.header);
         Written(s.rt);
         if (cur_->cmds.size() >= kBatchCommands) Submit();
-        g_perf_capture_ns += Ns(t);
+        uint64_t ns = Ns(t);
+        g_perf_capture_ns += ns;
+        draw_ns_ += ns;
     }
 
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
@@ -216,6 +275,19 @@ public:
         c.s1.header = Header(front.header);
         cur_->cmds.push_back(c);
         Use(front.header);
+        // where the capture goes, every 300 frames
+        static const bool diag = [] {
+            const char* e = std::getenv("BLACK_PERF_DIAG");
+            return e && *e == '1';
+        }();
+        if (++presents_ % 300 == 0 && draws_ && diag) {
+            LOGI("render thread: capture per draw %.2f us, of it state %.2f us; %.0f header copies per frame, %.0f index bytes per draw",
+                 draw_ns_ / 1e3 / draws_, state_ns_ / 1e3 / draws_, double(header_copies_) / 300, double(index_bytes_) / draws_);
+            draws_ = draw_ns_ = state_ns_ = header_copies_ = index_bytes_ = 0;
+        }
+        if (check_ && presents_ % 300 == 0)
+            LOGI("render thread: vsc dirty mask check: %llu captures, %llu clean pieces that differed",
+                 (unsigned long long)check_scans_, (unsigned long long)check_bad_);
         uint64_t id = Submit();
         g_perf_capture_ns += Ns(t);
         // the title records one frame while the one before it draws
@@ -231,6 +303,7 @@ public:
                 LOG_FIRST(16, "render thread: no finished copy of %08X for a NOOVERWRITE lock, reading it back now", data);
             }
             written_.insert(data);
+            last_written_ = ~0u;
             ReadBack(data, true);
         }
         Cmd c{Op::RecordLate};
@@ -256,19 +329,74 @@ public:
         cur_->cmds.push_back(c);
     }
 
+    // A batch is done once the render thread ran it. With zero copy the GPU reads guest memory when it draws: a
+    // vertex buffer it drew in place is free only once the GPU is past that frame, and a fence only once the GPU is
+    // past its frame when that frame read anything in place
     uint32_t Fence() override { return uint32_t(cur_->id); }
-    bool FencePending(uint32_t fence) override { return fence > done_.load(); }
-    void WaitFence(uint32_t fence) override { Wait(fence, WaitFor::Fence, "fence"); }
+    bool FencePending(uint32_t fence) override { return fence > done_.load() || !GpuDone(FenceFrame(fence)); }
+    void WaitFence(uint32_t fence) override {
+        Wait(fence, WaitFor::Fence, "fence");
+        WaitGpu(FenceFrame(fence));
+    }
     bool Busy(uint32_t resource) override {
         auto it = last_use_.find(resource);
-        return it != last_use_.end() && it->second > done_.load();
+        return it != last_use_.end() && (it->second > done_.load() || !GpuDone(ResourceFrame(resource)));
     }
     void WaitResource(uint32_t resource) override {
         auto it = last_use_.find(resource);
-        if (it != last_use_.end()) Wait(it->second, WaitFor::Resource, "resource");
+        if (it == last_use_.end()) return;
+        Wait(it->second, WaitFor::Resource, "resource");
+        WaitGpu(ResourceFrame(resource));
     }
 
 private:
+    static constexpr uint64_t kFrameRing = 1u << 16;  // batches remembered with their frame
+    // the present number the batch's draws belong to (presents the render thread ran before it)
+    uint64_t BatchFrame(uint64_t id) const { return batch_frame_[id & (kFrameRing - 1)].load(std::memory_order_acquire); }
+    // the present (+1) the GPU must be past before the CPU may write what the fence or resource covers, 0 none
+    uint64_t FenceFrame(uint64_t id) {
+#ifdef __SWITCH__
+        if (!id || !gpu::ZeroCopyActive() || id + kFrameRing <= next_id_) return 0;
+        uint64_t f = BatchFrame(id);
+        return gpu::FrameReadInPlace(f) ? f + 1 : 0;
+#else
+        (void)id;
+        return 0;
+#endif
+    }
+    uint64_t ResourceFrame(uint32_t resource) {
+#ifdef __SWITCH__
+        if (!gpu::ZeroCopyActive()) return 0;
+        return gpu::InPlaceFrame(mem::VirtualFromPhysical(kernel::R32(resource + 4)));
+#else
+        (void)resource;
+        return 0;
+#endif
+    }
+    bool GpuDone(uint64_t frame1) {
+#ifdef __SWITCH__
+        return !frame1 || gpu::GpuFrameDone(frame1 - 1);
+#else
+        (void)frame1;
+        return true;
+#endif
+    }
+    // until the GPU drew present frame1 - 1; one not presented yet is drawn by a flush
+    void WaitGpu(uint64_t frame1) {
+#ifdef __SWITCH__
+        if (GpuDone(frame1)) return;
+        uint64_t f = frame1 - 1;
+        if (f >= presents_run_.load()) {
+            cur_->cmds.push_back(Cmd{Op::Flush});
+            Wait(Submit(), WaitFor::Flush, "zero copy flush");
+        } else {
+            gpu::WaitGpuFrame(f);
+        }
+#else
+        (void)frame1;
+#endif
+    }
+
     Batch* NewBatch() {
         Batch* b;
         {
@@ -293,6 +421,7 @@ private:
 
     void ReadBack(uint32_t data, bool late) {
         // only surfaces the GPU wrote since the last read-back hold anything newer than guest memory
+        last_written_ = ~0u;
         if (!written_.erase(data)) return;
         (late ? g_perf_sync_late : g_perf_sync_block)++;
         if (diag::Perf() && logged_.insert(uint64_t(data) << 1 | (late ? 1 : 0)).second) {
@@ -321,13 +450,19 @@ private:
         if (!header || !ring_) return header;
         // vertex buffer, index buffer and palette headers are 12 bytes: reading 20 can run off the end of the heap
         const uint32_t type = kernel::R32(header) & 0x70000;  // 0 vertex, 0x10000 index, 0x30000 palette
-        uint8_t now[kHeaderBytes] = {};
-        std::memcpy(now, kernel::HostPtr(header), type < 0x20000 || type == 0x30000 ? 12 : kHeaderBytes);
-        Recent<HeaderCopy>& r = recent_headers_[(header >> 3) & 63];
+        uint8_t now[kHeaderBytes];
+        if (type < 0x20000 || type == 0x30000) {
+            std::memcpy(now, kernel::HostPtr(header), 12);
+            std::memset(now + 12, 0, kHeaderBytes - 12);
+        } else {
+            std::memcpy(now, kernel::HostPtr(header), kHeaderBytes);
+        }
+        Recent<HeaderCopy>& r = recent_headers_[ResourceSlot(header)];
         HeaderCopy& c = r.key == header ? *r.value : headers_[header];
         r = {header, &c};
-        if (c.made && !std::memcmp(c.bytes, now, kHeaderBytes) && ring_pos_ - c.made < kHeaderRing / 2) return c.at;
+        if (c.made && SameHeader(c.bytes, now) && ring_pos_ - c.made < kHeaderRing / 2) return c.at;
         c.at = Scratch(now, kHeaderBytes);
+        header_copies_++;
         c.made = ring_pos_;
         std::memcpy(c.bytes, now, kHeaderBytes);
         return c.at;
@@ -337,6 +472,12 @@ private:
     void Delta(const void* field, const void* value, size_t n) {
         uint8_t* sent = reinterpret_cast<uint8_t*>(&sent_) + At(sent_, field);
         if (Same(sent, static_cast<const uint8_t*>(value), n)) return;
+        StoreDelta(field, value, n);
+    }
+
+    // SendRange already compared a full piece; avoid scanning changed bytes twice.
+    void StoreDelta(const void* field, const void* value, size_t n) {
+        uint8_t* sent = reinterpret_cast<uint8_t*>(&sent_) + At(sent_, field);
         std::memcpy(sent, value, n);
         uint32_t head[2] = {uint32_t(At(sent_, field)), uint32_t(n)};
         size_t at = cur_->bytes.size();
@@ -351,17 +492,49 @@ private:
         size_t off = r.off;
         size_t end = r.off + r.len;
         for (; off + kPiece <= end; off += kPiece) {
-            if (!SamePiece(sent + off, now + off)) Delta(sent + off, now + off, kPiece);
+            if (!SamePiece(sent + off, now + off)) StoreDelta(sent + off, now + off, kPiece);
         }
         if (off < end) Delta(sent + off, now + off, end - off);
     }
 
+    // The vertex shader constants (3 KB) and the render and texture stage states (1.2 KB) of the 5 KB scanned per
+    // draw: only the pieces the HLE wrote since the last capture are compared (d3d/vsc_dirty.h), a clean piece being
+    // equal to the sent copy. The rest of each range (the pixel constants, the viewport; the tail piece) is compared
+    // as before. BLACK_CAPTURE_CHECK=1 compares the clean pieces too and counts those that differ: a writer the mask
+    // misses.
+    void SendMasked(const uint8_t* now, const Range& r, uint64_t& dirty_mask, uint32_t pieces) {
+        const uint8_t* sent = reinterpret_cast<const uint8_t*>(&sent_);
+        const uint64_t dirty = mask_ ? dirty_mask : ~0ull;  // BLACK_VSC_MASK=0: every piece compared, as before
+        dirty_mask = 0;
+        size_t off = r.off;
+        for (uint32_t p = 0; p < pieces; p++, off += kPiece) {
+            bool differs = false;
+            if (dirty >> p & 1) {
+                differs = !SamePiece(sent + off, now + off);
+            } else if (check_) {
+                differs = !SamePiece(sent + off, now + off);
+                if (differs) check_bad_++;
+            }
+            if (differs) StoreDelta(sent + off, now + off, kPiece);
+        }
+        if (check_) check_scans_++;
+        SendRange(now, Range{off, r.off + r.len - off});
+    }
+
     // what changed since the last command, in 64 byte pieces
-    void SendState(const State& s) {
+    void SendState(const State& s, bool fixed = false) {
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
-        for (const Range& r : ranges_) SendRange(now, r);
+        for (const Range& r : ranges_) {
+            if (r.off == vsc_off_) SendMasked(now, r, d3d::g_vsc_dirty, d3d::kVscPieces);
+            else if (r.off == rs_off_) SendMasked(now, r, d3d::g_rs_dirty, uint32_t(r.len / kPiece));
+            else SendRange(now, r);
+        }
+        // Clear and the like read none of it; a draw with a vertex program neither
+        bool prog = (s.vs_handle & 1) && s.vs && !s.vs->program.empty();
+        if (fixed && !prog)
+            for (const Range& r : fixed_) SendRange(now, r);
         std::array<uint32_t, 4> textures;
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
         Delta(&sent_.textures, &textures, sizeof(textures));
@@ -396,12 +569,15 @@ private:
     // resources by guest header: the batch that last read them
     void Use(uint32_t header) {
         if (!header) return;
-        Recent<uint64_t>& r = recent_uses_[(header >> 3) & 63];
+        Recent<uint64_t>& r = recent_uses_[ResourceSlot(header)];
         if (r.key != header) r = {header, &last_use_[header]};
         *r.value = cur_->id;
     }
     void Written(const Surface& s) {
-        if (s.header) written_.insert(mem::VirtualFromPhysical(s.data));
+        // most draws go to the target the last one did: the set is touched when it changes
+        if (!s.header || s.data == last_written_) return;
+        last_written_ = s.data;
+        written_.insert(mem::VirtualFromPhysical(s.data));
     }
 
     uint64_t Submit() {
@@ -433,10 +609,17 @@ private:
     }
 
     void Run() {
+#ifdef __SWITCH__
+        // core 2 preferred, any core of the process allowed (XBE_PIN placement may give the game thread core 2 too)
+        u64 mask = 0;
+        svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
+        if (mask >> 2 & 1) svcSetThreadCoreMask(CUR_THREAD_HANDLE, 2, u32(mask));
+#else
         using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
         if (auto set = reinterpret_cast<SetDescription>(
                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
             set(GetCurrentThread(), L"render");
+#endif
         for (;;) {
             Batch* b;
             {
@@ -446,6 +629,7 @@ private:
                 b = queue_.front();
                 queue_.pop_front();
             }
+            batch_frame_[b->id & (kFrameRing - 1)].store(presents_run_.load(), std::memory_order_release);
             for (const Cmd& c : b->cmds) Execute(*b, c);
             uint64_t id = b->id;
             b->cmds.clear();
@@ -482,7 +666,10 @@ private:
             case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
-            case Op::Present: inner_->Present(c.s1); break;
+            case Op::Present:
+                inner_->Present(c.s1);
+                presents_run_++;
+                break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;
@@ -494,6 +681,7 @@ private:
 
     std::unique_ptr<Backend> inner_;
     std::vector<Range> ranges_;
+    std::vector<Range> fixed_;
 
     // the title's thread
     struct HeaderCopy {
@@ -514,10 +702,23 @@ private:
     uint64_t ring_pos_ = 0;
     Batch* cur_ = nullptr;
     State sent_;  // the state as the render thread will have it
+    const size_t vsc_off_ = At(sent_, &sent_.vsc);
+    const size_t rs_off_ = At(sent_, &sent_.rs);
+    const bool check_ = [] {
+        const char* e = std::getenv("BLACK_CAPTURE_CHECK");
+        return e && *e == '1';
+    }();
+    const bool mask_ = [] {
+        const char* e = std::getenv("BLACK_VSC_MASK");
+        return !(e && *e == '0');
+    }();
+    uint64_t check_scans_ = 0, check_bad_ = 0;  // SendVsc under BLACK_CAPTURE_CHECK: captures, clean pieces that differed
     std::unordered_map<uint32_t, uint64_t> last_use_;
     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
+    uint32_t last_written_ = ~0u;           // the physical address Written last put in written_
     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
     uint64_t next_id_ = 0;
+    uint64_t presents_ = 0, draws_ = 0, draw_ns_ = 0, state_ns_ = 0, header_copies_ = 0, index_bytes_ = 0;  // capture diagnostics
     uint64_t last_present_ = 0;
 
     // the render thread
@@ -529,6 +730,8 @@ private:
     std::deque<Batch*> queue_;
     std::vector<Batch*> free_;
     std::atomic<uint64_t> done_{0};
+    std::atomic<uint64_t> presents_run_{0};                // presents the render thread ran
+    std::unique_ptr<std::atomic<uint64_t>[]> batch_frame_{new std::atomic<uint64_t>[kFrameRing]()};
     bool stop_ = false;
     bool exited_ = false;
 };
